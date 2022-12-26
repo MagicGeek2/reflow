@@ -11,7 +11,6 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 
-
 def setup_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
