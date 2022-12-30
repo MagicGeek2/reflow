@@ -1,9 +1,10 @@
-diffusers/
+/diffusers
 
-data/
-logs/
-tmp/
-checkpoints/
+/data
+/logs
+/tmp
+/checkpoints
+/xformers-main
 # ckpt
 *.pth
 *.pt
@@ -11,6 +12,7 @@ checkpoints/
 *.png
 *.jpg
 *.jpeg
+/.vscode
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

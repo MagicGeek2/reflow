@@ -216,10 +216,10 @@ def prepare_args():
     args = Namespace()
     args.infer_steps = 25
     args.seed = 2333
-    args.save_dir = 'data/coco2014_reflow/train/content'
-    args.split = 'train'
+    args.save_dir = 'data/coco2014_reflow/val/content'
+    args.split = 'val'
     args.devices = [1,2,3,4,5] # ! specify you gpus' numbers
-    args.total_nums = 1_000_000
+    args.total_nums = 10000
     args.bs=16
 
     return args
