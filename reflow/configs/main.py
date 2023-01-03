@@ -28,8 +28,8 @@ def get_config():
     training.snapshot_sampling = True
     training.sample_randz = False
     training.reduce_mean = True
-    training.num_steps = 20
-    training.batch_size = 8
+    training.num_steps = 1_000_000
+    training.batch_size = 16
     # training.sde = 'rectified_flow'
     # training.continuous = False
 
@@ -42,8 +42,8 @@ def get_config():
 
     # reflow
     config.reflow = reflow = ml_collections.ConfigDict()
-    reflow.reflow_t_schedule = 't0' # NOTE: t0, t1, uniform, or an integer k > 1
-    reflow.reflow_loss = 'lpips'  # NOTE: l2, lpips, lpips+l2
+    reflow.reflow_t_schedule = 'uniform' # NOTE: t0, t1, uniform, or an integer k > 1
+    reflow.reflow_loss = 'l2'  # NOTE: l2, lpips, lpips+l2
     # reflow.reflow_type = 'train_reflow'  # NOTE: generate_data_from_z0, train_reflow
     # reflow.last_flow_ckpt = 'ckpt_path' # NOTE: the rectified flow model to fine-tune
     # reflow.data_root = 'data_path'  # NOTE: the folder to load the generated data
@@ -53,32 +53,6 @@ def get_config():
     data.root_dir = 'data/coco2014_reflow'
     data.dl_workers = 1
     # data.centered = True
-
-    # # model
-    # model = config.model
-    # model.name = 'ncsnpp'
-    # model.scale_by_sigma = False
-    # model.ema_rate = 0.9999
-    # model.normalization = 'GroupNorm'
-    # model.nonlinearity = 'swish'
-    # model.nf = 128
-    # model.ch_mult = (1, 2, 2, 2)
-    # model.num_res_blocks = 4
-    # model.attn_resolutions = (16,)
-    # model.resamp_with_conv = True
-    # model.conditional = True
-    # model.fir = False
-    # model.fir_kernel = [1, 3, 3, 1]
-    # model.skip_rescale = True
-    # model.resblock_type = 'biggan'
-    # model.progressive = 'none'
-    # model.progressive_input = 'none'
-    # model.progressive_combine = 'sum'
-    # model.attention_type = 'ddpm'
-    # model.init_scale = 0.
-    # model.embedding_type = 'positional'
-    # model.fourier_scale = 16
-    # model.conv_size = 3
     
     optim=config.optim
     optim.use_8bit_adam = True

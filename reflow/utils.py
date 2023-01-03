@@ -4,6 +4,7 @@ import torch
 from pathlib import Path
 from reflow.sde_lib import RectifiedFlow
 from loguru import logger
+import random
 
 
 def decode_latents(vae, latents, float=True, cpu=True, permute=False) -> torch.Tensor:
@@ -206,6 +207,20 @@ def get_rectified_flow_loss_fn(sde, train, reduce_mean=True, eps=1e-3):
         # score = model_fn(perturbed_data, t*999)  # Copy from models/utils.py
         # compatible with diffusers
         score = model_fn(zt, timestep=t, **condition).sample
+        
+        def prepare_lpips_input(codec, in0, in1):
+            in0 = decode_latents(codec, in0, cpu=False)
+            in1 = decode_latents(codec, in1, cpu=False)
+            # crop 256px patch
+            # _,_,H,W=in0.shape
+            # scale=0.5
+            # h,w=int(H*scale),int(W*scale)
+            # h_start, w_start = random.randint(0,H-h), random.randint(0,W-w)
+            # lpips_in0=in0[:,:,h_start:h_start+h, w_start:w_start+w].clone()
+            # lpips_in1=in1[:,:,h_start:h_start+h, w_start:w_start+w].clone()
+            # del in0, in1
+            lpips_in0, lpips_in1 = in0, in1
+            return lpips_in0, lpips_in1
 
         if sde.reflow_flag:
             # we found LPIPS loss is the best for distillation when k=1; but good to have a try
@@ -214,18 +229,10 @@ def get_rectified_flow_loss_fn(sde, train, reduce_mean=True, eps=1e-3):
                 losses = torch.square(score - target)
             elif sde.reflow_loss == 'lpips':
                 assert sde.reflow_t_schedule == 't0'
-                losses = sde.lpips_model(
-                    decode_latents(sde.codec, z0+score, float=False, cpu=False),
-                    decode_latents(sde.codec, z1, float=False, cpu=False),
-                    normalize=True,
-                )
+                losses = sde.lpips_model(*prepare_lpips_input(sde.codec, z0+score, z1),normalize=True)
             elif sde.reflow_loss == 'lpips+l2':
                 assert sde.reflow_t_schedule == 't0'
-                lpips_losses = sde.lpips_model(
-                    decode_latents(sde.codec, z0+score, float=False, cpu=False),
-                    decode_latents(sde.codec, z1, float=False, cpu=False),
-                    normalize=True,
-                ).view(zshape[0], 1)
+                lpips_losses = sde.lpips_model(*prepare_lpips_input(sde.codec, z0+score, z1),normalize=True).view(zshape[0], 1)
                 l2_losses = torch.square(
                     score - target).view(zshape[0], -1).mean(dim=1, keepdim=True)
                 losses = lpips_losses + l2_losses
@@ -235,7 +242,6 @@ def get_rectified_flow_loss_fn(sde, train, reduce_mean=True, eps=1e-3):
             losses = torch.square(score - target)
 
         losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1)
-
         loss = torch.mean(losses)
         return loss
 

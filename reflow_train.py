@@ -3,17 +3,17 @@ from absl import flags
 from ml_collections.config_flags import config_flags
 from pathlib import Path
 from torch.utils import tensorboard
-
-from diffusers import AutoencoderKL, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer, XLMRobertaTokenizer
-from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
-from diffusers.utils.import_utils import is_xformers_available
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import trange
 from torchvision.utils import make_grid, save_image
 import numpy as np
 from loguru import logger
+
+from diffusers import AutoencoderKL, UNet2DConditionModel
+from transformers import CLIPTextModel, CLIPTokenizer, XLMRobertaTokenizer
+from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+from diffusers.utils.import_utils import is_xformers_available
 
 from reflow.utils import restore_checkpoint, save_checkpoint, optimization_manager, get_step_fn, get_sampling_fn, set_seed, decode_latents
 from reflow.utils import ExponentialMovingAverage
@@ -110,7 +110,6 @@ def create_models(config):
 
 def main(argv):
 
-    # TODO: logging configuration
     config, workdir = FLAGS.config, FLAGS.workdir
     workdir = Path(workdir)
 
@@ -139,7 +138,6 @@ def main(argv):
             raise ImportError(
                 "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
             )
-
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
@@ -254,25 +252,25 @@ def main(argv):
             save_checkpoint(
                 str(checkpoint_dir / f'checkpoint_s{step}.pth'), state)
 
+        if step % config.training.sampling_freq == 0:
             # Generate and save samples
-            if config.training.snapshot_sampling:
-                ema.store(score_model.parameters())
-                ema.copy_to(score_model.parameters())
-                eval_batch = to_device(next(eval_iter), config.device)
-                eval_step_fn_input = prepare_step_fn_input(eval_batch)
-                z0 = eval_step_fn_input.pop('z0')
-                z1 = eval_step_fn_input.pop('z1')
-                sample, n = sampling_fn(
-                    score_model,
-                    z=None if config.training.sample_randz else z0,
-                    condition=eval_step_fn_input
-                )
-                ema.restore(score_model.parameters())
+            ema.store(score_model.parameters())
+            ema.copy_to(score_model.parameters())
+            eval_batch = to_device(next(eval_iter), config.device)
+            eval_step_fn_input = prepare_step_fn_input(eval_batch)
+            z0 = eval_step_fn_input.pop('z0')
+            z1 = eval_step_fn_input.pop('z1')
+            sample, n = sampling_fn(
+                score_model,
+                z=None if config.training.sample_randz else z0,
+                condition=eval_step_fn_input
+            )
+            ema.restore(score_model.parameters())
 
-                images = decode_latents(vae, sample)
-                nrow = int(np.sqrt(sample.shape[0]))
-                image_grid = make_grid(images, nrow, padding=2)
-                save_image(image_grid, str(sample_dir / f'sample_s{step}.png'))
+            images = decode_latents(vae, sample)
+            nrow = int(np.sqrt(sample.shape[0]))
+            image_grid = make_grid(images, nrow, padding=2)
+            save_image(image_grid, str(sample_dir / f'sample_s{step}.png'))
 
 
 if __name__ == "__main__":
