@@ -18,7 +18,7 @@ def get_config():
     # data
     config.data = data = ml_collections.ConfigDict()
     data.image_size = 64
-    data.random_flip = True
+    data.random_flip = False
     data.num_channels = 4
 
     # optimization

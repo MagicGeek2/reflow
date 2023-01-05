@@ -17,6 +17,7 @@ def get_config():
     diffusers.score_model = 'unet_2d_condition_model'
     diffusers.load_score_model = False
     diffusers.gradient_checkpointing = True
+    diffusers.use_xformers = False
 
     # ema
     config.ema = ema = ml_collections.ConfigDict()
@@ -24,14 +25,21 @@ def get_config():
 
     # training
     training = config.training
-    training.ckpt_path = None
-    training.snapshot_sampling = True
-    training.sample_randz = False
+    training.ckpt_path = 'logs/tmp/checkpoints/checkpoint_s9.pth'
     training.reduce_mean = True
-    training.num_steps = 1_000_000
-    training.batch_size = 16
+    training.num_steps = 20
+    training.batch_size = 4
+    
+    training.gradient_accumulation_steps=4
+    training.mixed_precision='no'
+    
+    
     # training.sde = 'rectified_flow'
     # training.continuous = False
+    
+    # # # ! debug only
+    training.log_freq = 9
+    training.eval_freq = 9
 
     # sampling
     sampling = config.sampling
@@ -39,6 +47,7 @@ def get_config():
     sampling.init_type = 'gaussian'
     sampling.init_noise_scale = 1.0
     sampling.use_ode_sampler = 'rk45'
+    sampling.randz0 = False
 
     # reflow
     config.reflow = reflow = ml_collections.ConfigDict()
@@ -55,6 +64,7 @@ def get_config():
     # data.centered = True
     
     optim=config.optim
-    optim.use_8bit_adam = True
+    optim.use_8bit_adam = False
+    optim.lr_scheduler='constant_with_warmup'
 
     return config

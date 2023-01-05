@@ -9,13 +9,16 @@ from tqdm.auto import trange
 from torchvision.utils import make_grid, save_image
 import numpy as np
 from loguru import logger
+from typing import Iterable
 
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer, XLMRobertaTokenizer
 from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
 from diffusers.utils.import_utils import is_xformers_available
+from accelerate import Accelerator
+from diffusers.optimization import get_scheduler
 
-from reflow.utils import restore_checkpoint, save_checkpoint, optimization_manager, get_step_fn, get_sampling_fn, set_seed, decode_latents
+from reflow.utils import restore_checkpoint, save_checkpoint, optimization_manager, get_step_fn, get_sampling_fn, set_seed, decode_latents, get_loss_fn
 from reflow.utils import ExponentialMovingAverage
 from reflow.sde_lib import RectifiedFlow
 from reflow.data.reflow_with_text import DataPairsWithText
@@ -36,6 +39,67 @@ def cycle(dl):
         for batch in dl:
             yield batch
 
+class EMAModel:
+    """
+    Exponential Moving Average of models weights
+    """
+
+    def __init__(self, parameters: Iterable[torch.nn.Parameter], decay=0.9999):
+        parameters = list(parameters)
+        self.shadow_params = [p.clone().detach() for p in parameters]
+
+        self.decay = decay
+        self.optimization_step = 0
+
+    def get_decay(self, optimization_step):
+        """
+        Compute the decay factor for the exponential moving average.
+        """
+        value = (1 + optimization_step) / (10 + optimization_step)
+        return 1 - min(self.decay, value)
+
+    @torch.no_grad()
+    def step(self, parameters):
+        parameters = list(parameters)
+
+        self.optimization_step += 1
+        self.decay = self.get_decay(self.optimization_step)
+
+        for s_param, param in zip(self.shadow_params, parameters):
+            if param.requires_grad:
+                tmp = self.decay * (s_param - param)
+                s_param.sub_(tmp)
+            else:
+                s_param.copy_(param)
+
+        torch.cuda.empty_cache()
+
+    def copy_to(self, parameters: Iterable[torch.nn.Parameter]) -> None:
+        """
+        Copy current averaged parameters into given collection of parameters.
+
+        Args:
+            parameters: Iterable of `torch.nn.Parameter`; the parameters to be
+                updated with the stored moving averages. If `None`, the
+                parameters with which this `ExponentialMovingAverage` was
+                initialized will be used.
+        """
+        parameters = list(parameters)
+        for s_param, param in zip(self.shadow_params, parameters):
+            param.data.copy_(s_param.data)
+
+    def to(self, device=None, dtype=None) -> None:
+        r"""Move internal buffers of the ExponentialMovingAverage to `device`.
+
+        Args:
+            device: like `device` argument to `torch.Tensor.to`
+        """
+        # .to() on the tensors handles None correctly
+        self.shadow_params = [
+            p.to(device=device, dtype=dtype) if p.is_floating_point() else p.to(device=device)
+            for p in self.shadow_params
+        ]
+        
 
 def create_models(config):
     """
@@ -90,10 +154,11 @@ def create_models(config):
     # freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    # send to correct device
-    vae.to(config.device)
-    text_encoder.to(config.device)
-    score_model.to(config.device)
+    
+    # score_model.to(config.device)
+    
+    
+    
     # computing optimization
     if config.diffusers.gradient_checkpointing:
         score_model.enable_gradient_checkpointing()
@@ -116,7 +181,7 @@ def main(argv):
 
     logger.add(str(workdir / 'exp.log'))
     logger.info(f'\n{config}')
-
+    
     set_seed(config.seed)
 
     # Create directories for experimental logs
@@ -126,10 +191,20 @@ def main(argv):
     tb_dir = workdir/"tensorboard"
     tb_dir.mkdir(exist_ok=True)
     writer = tensorboard.SummaryWriter(str(tb_dir))
+    
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
+        mixed_precision=config.training.mixed_precision,
+    )
 
     tokenizer, text_encoder, vae, score_model = create_models(config)
-    ema = ExponentialMovingAverage(
-        score_model.parameters(), decay=config.ema.decay)
+    
+    weight_dtype = torch.float32
+    if config.training.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    vae.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+
 
     # Initialize the optimizer
     if config.optim.use_8bit_adam:
@@ -149,16 +224,14 @@ def main(argv):
         weight_decay=config.optim.weight_decay,
         eps=config.optim.eps,
     )
-
-    state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
-
-    ckpt_path = config.training.ckpt_path
-    if ckpt_path is not None:
-        state = restore_checkpoint(ckpt_path, state, config.device)
-    initial_step = int(state['step'])
-    checkpoint_dir = workdir/'checkpoints'
-    checkpoint_dir.mkdir(exist_ok=True)
-
+    
+    lr_scheduler = get_scheduler(
+        config.optim.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=config.optim.warmup * config.training.gradient_accumulation_steps,
+        num_training_steps=config.training.num_steps * config.training.gradient_accumulation_steps,
+    )
+    
     # 迭代 dataloader 的每个 batch 应得到 noise, latent, input_ids, attention_masks
     train_ds = DataPairsWithText(
         data_root=config.data.root_dir,
@@ -187,8 +260,29 @@ def main(argv):
         num_workers=config.data.dl_workers,
         # collate_fn=partial(collate_fn, tokenizer=tokenizer)
     )
+    
+    score_model, optimizer, train_dl, lr_scheduler = accelerator.prepare(
+        score_model, optimizer, train_dl, lr_scheduler
+    )
     train_iter = cycle(train_dl)
     eval_iter = cycle(eval_dl)
+    accelerator.register_for_checkpointing(lr_scheduler)
+    
+    ema = ExponentialMovingAverage(
+        score_model.parameters(), decay=config.ema.decay)
+    
+    # state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
+    state = dict(model=score_model, ema=ema, step=0)
+    ckpt_path = config.training.ckpt_path
+    if ckpt_path is not None:
+        state = restore_checkpoint(ckpt_path, state, accelerator.device)
+        accelerator.load_state(f'{ckpt_path}.acc')
+    initial_step = int(state['step'])
+    checkpoint_dir = workdir/'checkpoints'
+    checkpoint_dir.mkdir(exist_ok=True)
+    
+    if accelerator.is_main_process:
+        accelerator.init_trackers("tmp", config=vars(config))
 
     sde = RectifiedFlow(
         init_type=config.sampling.init_type,
@@ -198,7 +292,7 @@ def main(argv):
         reflow_loss=config.reflow.reflow_loss,
         use_ode_sampler=config.sampling.use_ode_sampler,
         codec=vae,
-        device=config.device,
+        device=accelerator.device,
     )
 
     # Building sampling functions
@@ -207,12 +301,17 @@ def main(argv):
     sampling_fn = get_sampling_fn(
         config, sde, sampling_shape, eps=1e-3)  # 使用 euler 或 rk45
 
-    optimize_fn = optimization_manager(config)
+    # optimize_fn = optimization_manager(config)
+    # reduce_mean = config.training.reduce_mean
+    
+    # train_step_fn = get_step_fn(sde, train=True, optimize_fn=optimize_fn,
+    #                             reduce_mean=reduce_mean, )
+    # eval_step_fn = get_step_fn(sde, train=False, optimize_fn=optimize_fn,
+    #                            reduce_mean=reduce_mean,)
+    
     reduce_mean = config.training.reduce_mean
-    train_step_fn = get_step_fn(sde, train=True, optimize_fn=optimize_fn,
-                                reduce_mean=reduce_mean, )
-    eval_step_fn = get_step_fn(sde, train=False, optimize_fn=optimize_fn,
-                               reduce_mean=reduce_mean,)
+    train_loss_fn = get_loss_fn(sde, train=True, reduce_mean=reduce_mean,)
+    eval_loss_fn = get_loss_fn(sde, train=False, reduce_mean=reduce_mean,)
 
     num_train_steps = config.training.num_steps
     logger.info(f'REFLOW T SCHEDULE: {config.reflow.reflow_t_schedule}')
@@ -229,47 +328,66 @@ def main(argv):
             'encoder_hidden_states': encoder_hidden_states,
         }
 
-    for step in trange(initial_step, num_train_steps, desc='Steps'):
-        # main training logic
-        batch = to_device(next(train_iter), config.device)
-        # Execute one training step
-        loss = train_step_fn(state, prepare_step_fn_input(batch))
+    for step in trange(initial_step, num_train_steps, desc='Steps', disable=not accelerator.is_local_main_process):
+        train_loss=0.0
+        for accumulation_step, batch in enumerate(train_iter, start=1):
+            with accelerator.accumulate(score_model):
+                loss = train_loss_fn(state, prepare_step_fn_input(batch))
+                avg_loss = accelerator.gather(loss.repeat(config.training.batch_size)).mean()
+                train_loss += avg_loss
+                
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(score_model.parameters(), config.optim.grad_clip)
+                    
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+                
+                if accumulation_step==config.training.gradient_accumulation_steps:
+                    break
+        train_loss = train_loss / config.training.gradient_accumulation_steps
+        
+        if accelerator.sync_gradients:
+            state['step'] += 1
+            state['ema'].update(score_model.parameters())
+        
+        if accelerator.is_main_process:
+            if step % config.training.log_freq == 0:
+                logger.info(f'step {step} | training_loss {train_loss.item():.5f}')
+                writer.add_scalar("training_loss", train_loss, step)
 
-        if step % config.training.log_freq == 0:
-            logger.info(f'step {step} | training_loss {loss.item():.5f}')
-            writer.add_scalar("training_loss", loss, step)
+            if step % config.training.eval_freq == 0:
+                eval_batch = to_device(next(eval_iter), accelerator.device)
+                eval_loss = eval_loss_fn(state, prepare_step_fn_input(eval_batch))
+                logger.info(f'step {step} | eval_loss {eval_loss.item():.5f}')
+                writer.add_scalar("eval_loss", eval_loss, step)
+                
+            if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps-1:
+                # Save the checkpoint.
+                save_checkpoint(
+                    str(checkpoint_dir / f'checkpoint_s{step}.pth'), state)
+                accelerator.save_state(str(checkpoint_dir / f'checkpoint_s{step}.pth.acc'))
+                
+            if step != 0 and step % config.training.sampling_freq == 0 or step == num_train_steps-1:
+                # Generate and save samples
+                ema.store(score_model.parameters())
+                ema.copy_to(score_model.parameters())
+                eval_batch = to_device(next(eval_iter), config.device)
+                eval_step_fn_input = prepare_step_fn_input(eval_batch)
+                z0 = eval_step_fn_input.pop('z0')
+                z1 = eval_step_fn_input.pop('z1')
+                sample, n = sampling_fn(
+                    score_model,
+                    z=None if config.sampling.randz0 else z0,
+                    condition=eval_step_fn_input
+                )
+                ema.restore(score_model.parameters())
 
-        if step % config.training.eval_freq == 0:
-            eval_batch = to_device(next(eval_iter), config.device)
-            eval_loss = eval_step_fn(state, prepare_step_fn_input(eval_batch))
-            logger.info(f'step {step} | eval_loss {eval_loss.item():.5f}')
-            writer.add_scalar("eval_loss", eval_loss, step)
-
-        # Save a checkpoint periodically and generate samples if needed
-        if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps-1:
-            # Save the checkpoint.
-            save_checkpoint(
-                str(checkpoint_dir / f'checkpoint_s{step}.pth'), state)
-
-        if step % config.training.sampling_freq == 0:
-            # Generate and save samples
-            ema.store(score_model.parameters())
-            ema.copy_to(score_model.parameters())
-            eval_batch = to_device(next(eval_iter), config.device)
-            eval_step_fn_input = prepare_step_fn_input(eval_batch)
-            z0 = eval_step_fn_input.pop('z0')
-            z1 = eval_step_fn_input.pop('z1')
-            sample, n = sampling_fn(
-                score_model,
-                z=None if config.sampling.randz0 else z0,
-                condition=eval_step_fn_input
-            )
-            ema.restore(score_model.parameters())
-
-            images = decode_latents(vae, sample)
-            nrow = int(np.sqrt(sample.shape[0]))
-            image_grid = make_grid(images, nrow, padding=2)
-            save_image(image_grid, str(sample_dir / f'sample_s{step}.png'))
+                images = decode_latents(vae, sample)
+                nrow = int(np.sqrt(sample.shape[0]))
+                image_grid = make_grid(images, nrow, padding=2)
+                save_image(image_grid, str(sample_dir / f'sample_s{step}.png'))
 
 
 if __name__ == "__main__":

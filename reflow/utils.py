@@ -180,7 +180,7 @@ def get_rectified_flow_loss_fn(sde, train, reduce_mean=True, eps=1e-3):
         bs = zshape[0]
 
         if sde.reflow_flag:
-            # distill for t = 0 (k=1)  # ! 实际上 t=eps , 会有问题吗?
+            # distill for t = 0 (k=1) 
             if sde.reflow_t_schedule == 't0':
                 t = torch.zeros(bs, device=device) * (sde.T - eps) + eps
             # # reverse distill for t=1 (fast embedding)
@@ -247,6 +247,34 @@ def get_rectified_flow_loss_fn(sde, train, reduce_mean=True, eps=1e-3):
 
     return loss_fn
 
+def get_loss_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False):
+    if isinstance(sde, RectifiedFlow):
+        loss_fn = get_rectified_flow_loss_fn(
+            sde, train, reduce_mean=reduce_mean)
+    else:
+        raise ValueError(
+            f"Discrete training for {sde.__class__.__name__} is not recommended.")
+    
+    def loss_fn_wrapper(state, batch):
+        model = state['model']
+        if train:
+            # optimizer = state['optimizer']
+            # optimizer.zero_grad()
+            loss = loss_fn(model, batch)
+            # loss.backward()
+            # optimize_fn(optimizer, model.parameters(), step=state['step'])
+            # state['step'] += 1
+            # state['ema'].update(model.parameters())
+        else:
+            with torch.no_grad():
+                ema = state['ema']
+                ema.store(model.parameters())
+                ema.copy_to(model.parameters())
+                loss = loss_fn(model, batch)
+                ema.restore(model.parameters())
+
+        return loss
+    return loss_fn_wrapper
 
 def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False):
     """Create a one-step training/evaluation function.
@@ -378,20 +406,25 @@ def restore_checkpoint(ckpt_path, state, device):
         return state
     else:
         loaded_state = torch.load(str(ckpt_path), map_location=device)
-        state['optimizer'].load_state_dict(loaded_state['optimizer'])
         state['model'].load_state_dict(loaded_state['model'], strict=False)
         state['ema'].load_state_dict(loaded_state['ema'])
         state['step'] = loaded_state['step']
+        
+        if loaded_state.get('optimizer', None):
+            state['optimizer'].load_state_dict(loaded_state['optimizer'])
+            
         return state
 
 
 def save_checkpoint(ckpt_path, state):
     saved_state = {
-        'optimizer': state['optimizer'].state_dict(),
+        # 'optimizer': state['optimizer'].state_dict(),
         'model': state['model'].state_dict(),
         'ema': state['ema'].state_dict(),
         'step': state['step']
     }
+    if state.get('optimizer', None):
+        saved_state['optimizer'] = state['optimizer'].state_dict()
     torch.save(saved_state, ckpt_path)
 
 
