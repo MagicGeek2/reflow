@@ -218,7 +218,7 @@ def prepare_args():
     args.seed = 2333
     args.save_dir = 'data/coco2014_reflow/val/content'
     args.split = 'val'
-    args.devices = [1,2,3,4,5] # ! specify you gpus' numbers
+    args.devices = [1,2,3,4,5] # ! specify your gpu_ids
     args.total_nums = 10000
     args.bs=16
 

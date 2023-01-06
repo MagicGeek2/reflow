@@ -39,67 +39,6 @@ def cycle(dl):
         for batch in dl:
             yield batch
 
-class EMAModel:
-    """
-    Exponential Moving Average of models weights
-    """
-
-    def __init__(self, parameters: Iterable[torch.nn.Parameter], decay=0.9999):
-        parameters = list(parameters)
-        self.shadow_params = [p.clone().detach() for p in parameters]
-
-        self.decay = decay
-        self.optimization_step = 0
-
-    def get_decay(self, optimization_step):
-        """
-        Compute the decay factor for the exponential moving average.
-        """
-        value = (1 + optimization_step) / (10 + optimization_step)
-        return 1 - min(self.decay, value)
-
-    @torch.no_grad()
-    def step(self, parameters):
-        parameters = list(parameters)
-
-        self.optimization_step += 1
-        self.decay = self.get_decay(self.optimization_step)
-
-        for s_param, param in zip(self.shadow_params, parameters):
-            if param.requires_grad:
-                tmp = self.decay * (s_param - param)
-                s_param.sub_(tmp)
-            else:
-                s_param.copy_(param)
-
-        torch.cuda.empty_cache()
-
-    def copy_to(self, parameters: Iterable[torch.nn.Parameter]) -> None:
-        """
-        Copy current averaged parameters into given collection of parameters.
-
-        Args:
-            parameters: Iterable of `torch.nn.Parameter`; the parameters to be
-                updated with the stored moving averages. If `None`, the
-                parameters with which this `ExponentialMovingAverage` was
-                initialized will be used.
-        """
-        parameters = list(parameters)
-        for s_param, param in zip(self.shadow_params, parameters):
-            param.data.copy_(s_param.data)
-
-    def to(self, device=None, dtype=None) -> None:
-        r"""Move internal buffers of the ExponentialMovingAverage to `device`.
-
-        Args:
-            device: like `device` argument to `torch.Tensor.to`
-        """
-        # .to() on the tensors handles None correctly
-        self.shadow_params = [
-            p.to(device=device, dtype=dtype) if p.is_floating_point() else p.to(device=device)
-            for p in self.shadow_params
-        ]
-        
 
 def create_models(config):
     """
@@ -157,9 +96,6 @@ def create_models(config):
     
     # score_model.to(config.device)
     
-    
-    
-    # computing optimization
     if config.diffusers.gradient_checkpointing:
         score_model.enable_gradient_checkpointing()
         
@@ -179,8 +115,6 @@ def main(argv):
     config, workdir = FLAGS.config, FLAGS.workdir
     workdir = Path(workdir)
 
-    logger.add(str(workdir / 'exp.log'))
-    logger.info(f'\n{config}')
     
     set_seed(config.seed)
 
@@ -196,6 +130,11 @@ def main(argv):
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         mixed_precision=config.training.mixed_precision,
     )
+    
+    if accelerator.is_main_process:
+        logger.add(str(workdir / 'exp.log'))
+        logger.info(f'\n{config}')
+    
 
     tokenizer, text_encoder, vae, score_model = create_models(config)
     
@@ -204,7 +143,6 @@ def main(argv):
         weight_dtype = torch.float16
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-
 
     # Initialize the optimizer
     if config.optim.use_8bit_adam:
@@ -314,9 +252,10 @@ def main(argv):
     eval_loss_fn = get_loss_fn(sde, train=False, reduce_mean=reduce_mean,)
 
     num_train_steps = config.training.num_steps
-    logger.info(f'REFLOW T SCHEDULE: {config.reflow.reflow_t_schedule}')
-    logger.info(f'LOSS: {config.reflow.reflow_loss}')
-    logger.info(f"Starting reflow training loop at step {initial_step}.")
+    if accelerator.is_main_process:
+        logger.info(f'REFLOW T SCHEDULE: {config.reflow.reflow_t_schedule}')
+        logger.info(f'LOSS: {config.reflow.reflow_loss}')
+        logger.info(f"Starting reflow training loop at step {initial_step}.")
 
     def prepare_step_fn_input(batch):
         z0 = batch.pop('noise')
@@ -328,9 +267,12 @@ def main(argv):
             'encoder_hidden_states': encoder_hidden_states,
         }
 
-    for step in trange(initial_step, num_train_steps, desc='Steps', disable=not accelerator.is_local_main_process):
+    pbar=trange(initial_step, num_train_steps, desc='Steps', disable=not accelerator.is_local_main_process)
+    for step in pbar:
         train_loss=0.0
-        for accumulation_step, batch in enumerate(train_iter, start=1):
+        for _ in range(config.training.gradient_accumulation_steps):
+            batch=next(train_iter)
+        # for accumulation_step, batch in enumerate(train_iter, start=1):
             with accelerator.accumulate(score_model):
                 loss = train_loss_fn(state, prepare_step_fn_input(batch))
                 avg_loss = accelerator.gather(loss.repeat(config.training.batch_size)).mean()
@@ -344,13 +286,14 @@ def main(argv):
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 
-                if accumulation_step==config.training.gradient_accumulation_steps:
-                    break
+                # if accumulation_step==config.training.gradient_accumulation_steps:
+                #     break
         train_loss = train_loss / config.training.gradient_accumulation_steps
         
         if accelerator.sync_gradients:
             state['step'] += 1
             state['ema'].update(score_model.parameters())
+            pbar.set_postfix({'train_loss':train_loss.item()})
         
         if accelerator.is_main_process:
             if step % config.training.log_freq == 0:
@@ -365,22 +308,22 @@ def main(argv):
                 
             if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps-1:
                 # Save the checkpoint.
+                accelerator.save_state(str(checkpoint_dir / f'checkpoint_s{step}.pth.acc'))
                 save_checkpoint(
                     str(checkpoint_dir / f'checkpoint_s{step}.pth'), state)
-                accelerator.save_state(str(checkpoint_dir / f'checkpoint_s{step}.pth.acc'))
                 
             if step != 0 and step % config.training.sampling_freq == 0 or step == num_train_steps-1:
                 # Generate and save samples
                 ema.store(score_model.parameters())
                 ema.copy_to(score_model.parameters())
-                eval_batch = to_device(next(eval_iter), config.device)
+                eval_batch = to_device(next(eval_iter), accelerator.device)
                 eval_step_fn_input = prepare_step_fn_input(eval_batch)
                 z0 = eval_step_fn_input.pop('z0')
                 z1 = eval_step_fn_input.pop('z1')
                 sample, n = sampling_fn(
                     score_model,
                     z=None if config.sampling.randz0 else z0,
-                    condition=eval_step_fn_input
+                    condition=eval_step_fn_input,
                 )
                 ema.restore(score_model.parameters())
 
@@ -388,6 +331,8 @@ def main(argv):
                 nrow = int(np.sqrt(sample.shape[0]))
                 image_grid = make_grid(images, nrow, padding=2)
                 save_image(image_grid, str(sample_dir / f'sample_s{step}.png'))
+                
+    pbar.close()
 
 
 if __name__ == "__main__":

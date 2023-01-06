@@ -8,9 +8,9 @@ def get_config():
     # training
     config.training = training = ml_collections.ConfigDict()
     training.snapshot_freq = 20000
-    training.sampling_freq = 5000
-    training.log_freq = 50
-    training.eval_freq = 50
+    training.sampling_freq = 2000
+    training.log_freq = 20
+    training.eval_freq = 20
 
     # sampling
     config.sampling = sampling = ml_collections.ConfigDict()

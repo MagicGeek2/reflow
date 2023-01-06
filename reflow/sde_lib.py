@@ -86,12 +86,9 @@ class RectifiedFlow():
 
         return x
 
-    def get_z0(self, batch, train=True):
-        n, c, h, w = batch.shape
-
+    def get_z0(self, shape_tensor, train=True):
         if self.init_type == 'gaussian':
             # standard gaussian #+ 0.5
-            cur_shape = (n, c, h, w)
-            return torch.randn(cur_shape)*self.noise_scale
+            return torch.randn_like(shape_tensor)*self.noise_scale
         else:
             raise NotImplementedError("INITIALIZATION TYPE NOT IMPLEMENTED")

@@ -21,7 +21,7 @@ def decode_latents(vae, latents, float=True, cpu=True, permute=False) -> torch.T
     return image
 
 
-def get_rectified_flow_sampler(sde, shape, inverse_scaler=None, device='cuda'):
+def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
     """
     Get rectified flow sampler
 
@@ -42,7 +42,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None, device='cuda'):
             if z is None:
                 # * 50.
                 z0 = sde.get_z0(torch.zeros(
-                    shape, device=device), train=False).to(device)
+                    shape, device=model.device), train=False)
                 x = z0.detach().clone()
 
             else:
@@ -56,7 +56,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None, device='cuda'):
             for i in range(sde.sample_N):
 
                 num_t = i / sde.sample_N * (sde.T - eps) + eps
-                t = torch.ones(shape[0], device=device) * num_t
+                t = torch.ones(shape[0], device=x.device) * num_t
                 t = (999*t).long()
                 # pred = model_fn(x, t*999)  # Copy from models/utils.py
                 # compatible with diffusers
@@ -68,7 +68,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None, device='cuda'):
                     0.5 * num_t * (1.-num_t) * pred - 0.5 * (2.-num_t)*x.detach().clone())
 
                 x = x.detach().clone() + pred_sigma * dt + sigma_t * \
-                    np.sqrt(dt) * torch.randn_like(pred_sigma).to(device)
+                    np.sqrt(dt) * torch.randn_like(pred_sigma, device=x.device)
 
             # x = inverse_scaler(x)
             nfe = sde.sample_N
@@ -91,7 +91,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None, device='cuda'):
             # Initial sample
             if z is None:
                 z0 = sde.get_z0(torch.zeros(
-                    shape, device=device), train=False).to(device)
+                    shape, device=model.device), train=False)
                 x = z0.detach().clone()
             else:
                 x = z
@@ -99,8 +99,8 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None, device='cuda'):
             model_fn = get_model_fn(model, train=False)
 
             def ode_func(t, x, condition):
-                x = from_flattened_numpy(x, shape).to(
-                    device).type(torch.float32)
+                # x = from_flattened_numpy(x, shape).to(device).type(torch.float32)
+                x = from_flattened_numpy(x, shape).type(torch.float32)
                 vec_t = torch.ones(shape[0], device=x.device) * t
                 vec_t = (999*vec_t).long()
                 # compatible with diffusers
@@ -114,8 +114,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None, device='cuda'):
             solution = integrate.solve_ivp(ode_func, (eps, sde.T), to_flattened_numpy(x),
                                            rtol=rtol, atol=atol, method=method, args=(condition,))
             nfe = solution.nfev
-            x = torch.tensor(
-                solution.y[:, -1]).reshape(shape).to(device).type(torch.float32)
+            x = torch.tensor(solution.y[:, -1], dtype=torch.float32, device=x.device).reshape(shape)
 
             # x = inverse_scaler(x)
 
@@ -147,8 +146,7 @@ def get_sampling_fn(config, sde, shape, inverse_scaler=None, eps=1e-3):
 
     sampler_name = config.sampling.method
     if sampler_name.lower() == 'rectified_flow':
-        sampling_fn = get_rectified_flow_sampler(
-            sde=sde, shape=shape, device=config.device)
+        sampling_fn = get_rectified_flow_sampler(sde=sde, shape=shape)
     else:
         raise ValueError(f"Sampler name {sampler_name} unknown.")
 

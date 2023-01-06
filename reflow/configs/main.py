@@ -15,7 +15,7 @@ def get_config():
     diffusers.text_encoder = 'xlm_roberta_text_model'
     diffusers.vae = 'autoencoder_kl'
     diffusers.score_model = 'unet_2d_condition_model'
-    diffusers.load_score_model = False
+    diffusers.load_score_model = True
     diffusers.gradient_checkpointing = True
     diffusers.use_xformers = False
 
@@ -25,22 +25,17 @@ def get_config():
 
     # training
     training = config.training
-    training.ckpt_path = 'logs/tmp/checkpoints/checkpoint_s9.pth'
+    training.ckpt_path = None
     training.reduce_mean = True
-    training.num_steps = 20
-    training.batch_size = 4
-    
-    training.gradient_accumulation_steps=4
+    training.num_steps = 100_0000
+    training.batch_size = 1
+    training.gradient_accumulation_steps = 8
     training.mixed_precision='no'
+    # # ! debug only
+    # training.log_freq = 9
+    # training.eval_freq = 9
+    # training.snapshot_freq = 10
     
-    
-    # training.sde = 'rectified_flow'
-    # training.continuous = False
-    
-    # # # ! debug only
-    training.log_freq = 9
-    training.eval_freq = 9
-
     # sampling
     sampling = config.sampling
     sampling.method = 'rectified_flow'
@@ -51,11 +46,8 @@ def get_config():
 
     # reflow
     config.reflow = reflow = ml_collections.ConfigDict()
-    reflow.reflow_t_schedule = 'uniform' # NOTE: t0, t1, uniform, or an integer k > 1
-    reflow.reflow_loss = 'l2'  # NOTE: l2, lpips, lpips+l2
-    # reflow.reflow_type = 'train_reflow'  # NOTE: generate_data_from_z0, train_reflow
-    # reflow.last_flow_ckpt = 'ckpt_path' # NOTE: the rectified flow model to fine-tune
-    # reflow.data_root = 'data_path'  # NOTE: the folder to load the generated data
+    reflow.reflow_t_schedule = 't0' # NOTE: t0, t1, uniform, or an integer k > 1
+    reflow.reflow_loss = 'lpips'  # NOTE: l2, lpips, lpips+l2
 
     # data
     data = config.data
@@ -66,5 +58,7 @@ def get_config():
     optim=config.optim
     optim.use_8bit_adam = False
     optim.lr_scheduler='constant_with_warmup'
+    
+    config.device=None
 
     return config
