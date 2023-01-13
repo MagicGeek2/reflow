@@ -90,11 +90,7 @@ def create_models(config):
     # freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    # send to correct device
-    vae.to(config.device)
-    text_encoder.to(config.device)
-    score_model.to(config.device)
-    # computing optimization
+    
     if config.diffusers.gradient_checkpointing:
         score_model.enable_gradient_checkpointing()
         
@@ -128,6 +124,10 @@ def main(argv):
     writer = tensorboard.SummaryWriter(str(tb_dir))
 
     tokenizer, text_encoder, vae, score_model = create_models(config)
+    # send to correct device
+    vae.to(config.device)
+    text_encoder.to(config.device)
+    score_model.to(config.device)
     ema = ExponentialMovingAverage(
         score_model.parameters(), decay=config.ema.decay)
 
@@ -229,11 +229,14 @@ def main(argv):
             'encoder_hidden_states': encoder_hidden_states,
         }
 
-    for step in trange(initial_step, num_train_steps, desc='Steps'):
+    pbar=trange(initial_step, num_train_steps, desc='Steps')
+    for step in pbar:
         # main training logic
         batch = to_device(next(train_iter), config.device)
         # Execute one training step
         loss = train_step_fn(state, prepare_step_fn_input(batch))
+        
+        pbar.set_postfix({'train_loss': loss.item()})
 
         if step % config.training.log_freq == 0:
             logger.info(f'step {step} | training_loss {loss.item():.5f}')
@@ -270,7 +273,7 @@ def main(argv):
             nrow = int(np.sqrt(sample.shape[0]))
             image_grid = make_grid(images, nrow, padding=2)
             save_image(image_grid, str(sample_dir / f'sample_s{step}.png'))
-
+    pbar.close()
 
 if __name__ == "__main__":
     FLAGS = flags.FLAGS

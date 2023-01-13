@@ -19,9 +19,7 @@ class DummyCodec(torch.nn.Module):
 
 class RectifiedFlow():
     def __init__(self, init_type='gaussian', noise_scale=1.0, reflow_flag=False, reflow_t_schedule='uniform', reflow_loss='l2', use_ode_sampler='rk45', sigma_var=0.0, ode_tol=1e-5, sample_N=None, codec=None, device='cpu'):
-        if sample_N is not None:
-            self.sample_N = sample_N
-            logger.info(f'Number of sampling steps: {self.sample_N}')
+        
         self.init_type = init_type
 
         self.noise_scale = noise_scale
@@ -31,6 +29,11 @@ class RectifiedFlow():
         logger.info(f'Init. Distribution Variance: {self.noise_scale}')
         logger.info(f'SDE Sampler Variance: {sigma_var}')
         logger.info(f'ODE Tolerence: {self.ode_tol}')
+        
+        if use_ode_sampler in ['euler']:
+            if sample_N is not None:
+                self.sample_N = sample_N
+                logger.info(f'Number of sampling steps: {self.sample_N}')
 
         self.reflow_flag = reflow_flag
         if self.reflow_flag:

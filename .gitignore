@@ -2,6 +2,7 @@
 
 new.py
 /data
+/samples
 /logs
 /tmp
 /checkpoints

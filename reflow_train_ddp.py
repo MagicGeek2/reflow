@@ -9,106 +9,16 @@ from tqdm.auto import trange
 from torchvision.utils import make_grid, save_image
 import numpy as np
 from loguru import logger
-from typing import Iterable
 
-from diffusers import AutoencoderKL, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer, XLMRobertaTokenizer
-from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
-from diffusers.utils.import_utils import is_xformers_available
 from accelerate import Accelerator
 from diffusers.optimization import get_scheduler
 
-from reflow.utils import restore_checkpoint, save_checkpoint, optimization_manager, get_step_fn, get_sampling_fn, set_seed, decode_latents, get_loss_fn
+from reflow.utils import get_sampling_fn, set_seed, decode_latents, get_loss_fn
 from reflow.utils import ExponentialMovingAverage
 from reflow.sde_lib import RectifiedFlow
 from reflow.data.reflow_with_text import DataPairsWithText
 from reflow.data.utils import get_image_transforms
-
-def to_device(data, device):
-    if isinstance(data, dict):
-        for k, v in data.items():
-            try:
-                data[k] = v.to(device)
-            except:
-                ...
-    return data
-
-
-def cycle(dl):
-    while True:
-        for batch in dl:
-            yield batch
-
-
-def create_models(config):
-    """
-    tokenizer, text_encoder, vae 固定不变，使用 hugface from_pretrained 的加载方式
-
-    score_model 类型: nn.Module -> ModelMixin ->  UNet2DConditionModel , 可以兼容 reflow 的 load 和 save 方式
-
-    新建 score_model 的时候提供两种选择:
-
-        1. 完全新建，从 unet config 中构建模型，不加载权重
-
-            config = UNet2DConditionModel.load_config(
-                'checkpoints/AltDiffusion', subfolder='unet')
-            unet = UNet2DConditionModel.from_config(config)
-
-        2. 加载预训练文生图模型的 unet 权重 (sd 或 altDiff 的 unet 权重)
-
-            unet = UNet2DConditionModel.from_pretrained(
-                'checkpoints/AltDiffusion', subfolder='unet')
-    """
-
-    _MODELS = {
-        'clip_text_model': CLIPTextModel,
-        'clip_tokenizer': CLIPTokenizer,
-
-        'xlm_roberta_text_model': RobertaSeriesModelWithTransformation,
-        'xlm_roberta_tokenizer': XLMRobertaTokenizer,
-
-        'autoencoder_kl': AutoencoderKL,
-        'unet_2d_condition_model': UNet2DConditionModel,
-    }
-
-    def create_submodel(name, part, ckpt_path, load_weights=True):
-        model_cls = _MODELS[name]
-        if load_weights:
-            submodel = model_cls.from_pretrained(ckpt_path, subfolder=part)
-        else:
-            submodel_config = model_cls.load_config(ckpt_path, subfolder=part)
-            submodel = model_cls.from_config(submodel_config)
-        return submodel
-
-    # create submodels
-    tokenizer = create_submodel(
-        config.diffusers.tokenizer, 'tokenizer', config.diffusers.ckpt_path)
-    text_encoder = create_submodel(
-        config.diffusers.text_encoder, 'text_encoder', config.diffusers.ckpt_path)
-    vae = create_submodel(config.diffusers.vae, 'vae',
-                          config.diffusers.ckpt_path)
-    score_model = create_submodel(config.diffusers.score_model, 'unet',
-                                  config.diffusers.ckpt_path, load_weights=config.diffusers.load_score_model)
-
-    # freeze vae and text_encoder
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    
-    # score_model.to(config.device)
-    
-    if config.diffusers.gradient_checkpointing:
-        score_model.enable_gradient_checkpointing()
-        
-    if config.diffusers.use_xformers:
-        try:
-            score_model.enable_xformers_memory_efficient_attention()
-        except Exception as e:
-            logger.warning(
-                f"Could not enable memory efficient attention. Make sure xformers is installed correctly and a GPU is available: {e}"
-            )
-
-    return tokenizer, text_encoder, vae, score_model
-
+from reflow.utils import create_models, to_device, cycle
 
 def main(argv):
 
@@ -204,18 +114,17 @@ def main(argv):
     )
     train_iter = cycle(train_dl)
     eval_iter = cycle(eval_dl)
-    accelerator.register_for_checkpointing(lr_scheduler)
+    # accelerator.register_for_checkpointing(lr_scheduler)
     
-    ema = ExponentialMovingAverage(
-        score_model.parameters(), decay=config.ema.decay)
-    
-    # state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
-    state = dict(model=score_model, ema=ema, step=0)
+    initial_step=0
     ckpt_path = config.training.ckpt_path
     if ckpt_path is not None:
-        state = restore_checkpoint(ckpt_path, state, accelerator.device)
-        accelerator.load_state(f'{ckpt_path}.acc')
-    initial_step = int(state['step'])
+        # state = restore_checkpoint(ckpt_path, state, accelerator.device)
+        initial_step = int(ckpt_path.split('/')[-1].split('_')[-1][1:]) # checkpoints_s{xxx}
+        accelerator.load_state(f'{ckpt_path}')
+    ema = ExponentialMovingAverage(
+        score_model.parameters(), decay=config.ema.decay)
+    state = dict(model=score_model, ema=ema, step=initial_step)
     checkpoint_dir = workdir/'checkpoints'
     checkpoint_dir.mkdir(exist_ok=True)
     
@@ -229,6 +138,7 @@ def main(argv):
         reflow_t_schedule=config.reflow.reflow_t_schedule,
         reflow_loss=config.reflow.reflow_loss,
         use_ode_sampler=config.sampling.use_ode_sampler,
+        sample_N=config.sampling.sample_N,
         codec=vae,
         device=accelerator.device,
     )
@@ -272,7 +182,8 @@ def main(argv):
         train_loss=0.0
         for _ in range(config.training.gradient_accumulation_steps):
             batch=next(train_iter)
-        # for accumulation_step, batch in enumerate(train_iter, start=1):
+            if config.training.randz0:
+                batch['noise'] = torch.randn_like(batch['noise']) # 1-reflow , random noise for same target
             with accelerator.accumulate(score_model):
                 loss = train_loss_fn(state, prepare_step_fn_input(batch))
                 avg_loss = accelerator.gather(loss.repeat(config.training.batch_size)).mean()
@@ -306,13 +217,15 @@ def main(argv):
                 logger.info(f'step {step} | eval_loss {eval_loss.item():.5f}')
                 writer.add_scalar("eval_loss", eval_loss, step)
                 
-            if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps-1:
+            if step != initial_step and step % config.training.snapshot_freq == 0 or step == num_train_steps-1:
                 # Save the checkpoint.
-                accelerator.save_state(str(checkpoint_dir / f'checkpoint_s{step}.pth.acc'))
-                save_checkpoint(
-                    str(checkpoint_dir / f'checkpoint_s{step}.pth'), state)
+                accelerator.save_state(str(checkpoint_dir / f'checkpoint_s{step}'))
+                # save_checkpoint(str(checkpoint_dir / f'checkpoint_s{step}.pth'), state)
+                score_model_to_save = accelerator.unwrap_model(score_model)
+                ema.copy_to(score_model_to_save.parameters())
+                torch.save(score_model_to_save.state_dict(), str(checkpoint_dir / f'score_model_s{step}.pth'))
                 
-            if step != 0 and step % config.training.sampling_freq == 0 or step == num_train_steps-1:
+            if step != initial_step and step % config.training.sampling_freq == 0 or step == num_train_steps-1:
                 # Generate and save samples
                 ema.store(score_model.parameters())
                 ema.copy_to(score_model.parameters())

@@ -5,6 +5,7 @@ from pathlib import Path
 from reflow.sde_lib import RectifiedFlow
 from loguru import logger
 import random
+from einops import rearrange
 
 
 def decode_latents(vae, latents, float=True, cpu=True, permute=False) -> torch.Tensor:
@@ -28,7 +29,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
     Returns:
       A sampling function that returns samples and the number of function evaluations during sampling.
     """
-    def euler_sampler(model, z=None, condition=None):
+    def euler_sampler(model, z=None, condition=None, return_traj=False):
         """The probability flow ODE sampler with simple Euler discretization.
 
         Args:
@@ -37,16 +38,19 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
         Returns:
           samples, number of function evaluations.
         """
+        device=model.device
         with torch.no_grad():
             # Initial sample
             if z is None:
                 # * 50.
                 z0 = sde.get_z0(torch.zeros(
-                    shape, device=model.device), train=False)
+                    shape, device=device), train=False)
                 x = z0.detach().clone()
 
             else:
                 x = z
+            if return_traj:
+                traj = [x]
 
             model_fn = get_model_fn(model, train=False)
 
@@ -56,7 +60,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
             for i in range(sde.sample_N):
 
                 num_t = i / sde.sample_N * (sde.T - eps) + eps
-                t = torch.ones(shape[0], device=x.device) * num_t
+                t = torch.ones(shape[0], device=device) * num_t
                 t = (999*t).long()
                 # pred = model_fn(x, t*999)  # Copy from models/utils.py
                 # compatible with diffusers
@@ -64,17 +68,23 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
 
                 # convert to diffusion models if sampling.sigma_variance > 0.0 while perserving the marginal probability
                 sigma_t = sde.sigma_t(num_t)
-                pred_sigma = pred + (sigma_t**2)/(2*(sde.noise_scale**2)*((1.-num_t)**2)) * (
-                    0.5 * num_t * (1.-num_t) * pred - 0.5 * (2.-num_t)*x.detach().clone())
-
-                x = x.detach().clone() + pred_sigma * dt + sigma_t * \
-                    np.sqrt(dt) * torch.randn_like(pred_sigma, device=x.device)
-
+                if sigma_t>0.0:
+                    pred_sigma = pred + (sigma_t**2)/(2*(sde.noise_scale**2)*((1.-num_t)**2)) * (
+                        0.5 * num_t * (1.-num_t) * pred - 0.5 * (2.-num_t)*x.detach().clone())
+                    x = x.detach().clone() + pred_sigma * dt + sigma_t * np.sqrt(dt) * torch.randn_like(pred_sigma, device=device)
+                else:
+                    x = x.detach().clone() + pred * dt
+                    
+                if return_traj:
+                    traj.append(x)
             # x = inverse_scaler(x)
             nfe = sde.sample_N
+            if return_traj:
+                traj = torch.stack(traj).transpose(0,1) # (b,l,c,h,w)
+                return x, nfe, traj
             return x, nfe
 
-    def rk45_sampler(model, z=None, condition=None):
+    def rk45_sampler(model, z=None, condition=None, return_traj=False):
         """The probability flow ODE sampler with black-box ODE solver.
 
         Args:
@@ -83,6 +93,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
         Returns:
           samples, number of function evaluations.
         """
+        device=model.device
         with torch.no_grad():
             rtol = atol = sde.ode_tol
             method = 'RK45'
@@ -91,7 +102,7 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
             # Initial sample
             if z is None:
                 z0 = sde.get_z0(torch.zeros(
-                    shape, device=model.device), train=False)
+                    shape, device=device), train=False)
                 x = z0.detach().clone()
             else:
                 x = z
@@ -99,9 +110,9 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
             model_fn = get_model_fn(model, train=False)
 
             def ode_func(t, x, condition):
-                # x = from_flattened_numpy(x, shape).to(device).type(torch.float32)
-                x = from_flattened_numpy(x, shape).type(torch.float32)
-                vec_t = torch.ones(shape[0], device=x.device) * t
+                x = from_flattened_numpy(x, shape).to(device).type(torch.float32)
+                # x = from_flattened_numpy(x, shape).type(torch.float32)
+                vec_t = torch.ones(shape[0], device=device) * t
                 vec_t = (999*vec_t).long()
                 # compatible with diffusers
                 drift = model_fn(x, timestep=t, **condition).sample
@@ -114,7 +125,12 @@ def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
             solution = integrate.solve_ivp(ode_func, (eps, sde.T), to_flattened_numpy(x),
                                            rtol=rtol, atol=atol, method=method, args=(condition,))
             nfe = solution.nfev
-            x = torch.tensor(solution.y[:, -1], dtype=torch.float32, device=x.device).reshape(shape)
+            x = torch.tensor(solution.y[:, -1], dtype=torch.float32, device=device).reshape(shape)
+            if return_traj:
+                b,c,h,w = shape
+                traj = torch.tensor(solution.y, dtype=torch.float32, device=device)
+                traj = rearrange(traj, '(b c h w) l -> b l c h w', b=b, c=c, h=h, w=w)
+                return x, nfe, traj
 
             # x = inverse_scaler(x)
 
@@ -408,7 +424,7 @@ def restore_checkpoint(ckpt_path, state, device):
         state['ema'].load_state_dict(loaded_state['ema'])
         state['step'] = loaded_state['step']
         
-        if loaded_state.get('optimizer', None):
+        if loaded_state.get('optimizer', None) and state.get('optimizer', None):
             state['optimizer'].load_state_dict(loaded_state['optimizer'])
             
         return state
@@ -531,3 +547,93 @@ class ExponentialMovingAverage:
         self.decay = state_dict['decay']
         self.num_updates = state_dict['num_updates']
         self.shadow_params = state_dict['shadow_params']
+
+
+def to_device(data, device):
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                data[k] = v.to(device)
+            except:
+                ...
+    return data
+
+
+def cycle(dl):
+    while True:
+        for batch in dl:
+            yield batch
+
+from diffusers import AutoencoderKL, UNet2DConditionModel
+from transformers import CLIPTextModel, CLIPTokenizer, XLMRobertaTokenizer
+from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+
+def create_models(config):
+    """
+    tokenizer, text_encoder, vae 固定不变，使用 hugface from_pretrained 的加载方式
+
+    score_model 类型: nn.Module -> ModelMixin ->  UNet2DConditionModel , 可以兼容 reflow 的 load 和 save 方式
+
+    新建 score_model 的时候提供两种选择:
+
+        1. 完全新建，从 unet config 中构建模型，不加载权重
+
+            config = UNet2DConditionModel.load_config(
+                'checkpoints/AltDiffusion', subfolder='unet')
+            unet = UNet2DConditionModel.from_config(config)
+
+        2. 加载预训练文生图模型的 unet 权重 (sd 或 altDiff 的 unet 权重)
+
+            unet = UNet2DConditionModel.from_pretrained(
+                'checkpoints/AltDiffusion', subfolder='unet')
+    """
+
+    _MODELS = {
+        'clip_text_model': CLIPTextModel,
+        'clip_tokenizer': CLIPTokenizer,
+
+        'xlm_roberta_text_model': RobertaSeriesModelWithTransformation,
+        'xlm_roberta_tokenizer': XLMRobertaTokenizer,
+
+        'autoencoder_kl': AutoencoderKL,
+        'unet_2d_condition_model': UNet2DConditionModel,
+    }
+
+    def create_submodel(name, part, ckpt_path, load_weights=True):
+        model_cls = _MODELS[name]
+        if load_weights:
+            submodel = model_cls.from_pretrained(ckpt_path, subfolder=part)
+        else:
+            submodel_config = model_cls.load_config(ckpt_path, subfolder=part)
+            submodel = model_cls.from_config(submodel_config)
+        return submodel
+
+    # create submodels
+    tokenizer = create_submodel(
+        config.diffusers.tokenizer, 'tokenizer', config.diffusers.ckpt_path)
+    text_encoder = create_submodel(
+        config.diffusers.text_encoder, 'text_encoder', config.diffusers.ckpt_path)
+    vae = create_submodel(config.diffusers.vae, 'vae',
+                          config.diffusers.ckpt_path)
+    score_model = create_submodel(config.diffusers.score_model, 'unet',
+                                  config.diffusers.ckpt_path, load_weights=config.diffusers.load_score_model)
+
+    # freeze vae and text_encoder
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    
+    # score_model.to(config.device)
+    
+    if config.diffusers.gradient_checkpointing:
+        score_model.enable_gradient_checkpointing()
+        
+    if config.diffusers.use_xformers:
+        try:
+            score_model.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            logger.warning(
+                f"Could not enable memory efficient attention. Make sure xformers is installed correctly and a GPU is available: {e}"
+            )
+
+    return tokenizer, text_encoder, vae, score_model
+
