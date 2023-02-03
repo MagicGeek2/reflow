@@ -24,7 +24,7 @@ def decode_latents(vae, latents, float=True, cpu=True, permute=False) -> torch.T
 
 def get_rectified_flow_sampler(sde, shape, inverse_scaler=None):
     """
-    Get rectified flow sampler
+    Get rectified flow sampler. 如果传入其他 Diffusion 模型需要给 pred 或者 dt 加负号. 
 
     Returns:
       A sampling function that returns samples and the number of function evaluations during sampling.

@@ -27,7 +27,7 @@ def get_config():
     optim.betas = (0.9, 0.999)
     optim.weight_decay = 0.
     optim.eps = 1e-8
-    optim.warmup = 5000
+    optim.warmup = 2000
     optim.grad_clip = 1.
     # optim.optimizer = 'Adam'
 

@@ -1,6 +1,7 @@
 import torch
 from loguru import logger
-from diffusers.models.vae import AutoencoderKLOutput, DecoderOutput
+from diffusers.models.vae import DecoderOutput
+from diffusers.models.autoencoder_kl import AutoencoderKLOutput
 
 
 class DummyCodec(torch.nn.Module):

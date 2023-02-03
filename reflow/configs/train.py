@@ -15,7 +15,7 @@ def get_config():
     diffusers.text_encoder = 'xlm_roberta_text_model'
     diffusers.vae = 'autoencoder_kl'
     diffusers.score_model = 'unet_2d_condition_model'
-    diffusers.load_score_model = False
+    diffusers.load_score_model = True
     diffusers.gradient_checkpointing = True
     diffusers.use_xformers = False
 
@@ -25,12 +25,12 @@ def get_config():
 
     # training
     training = config.training
-    training.ckpt_path = 'logs/2_reflow_AltInit/checkpoints/checkpoint_s200000'
+    training.ckpt_path = None
     training.reduce_mean = True
-    training.randz0 = False # NOTE : 1-reflow if True (random noise for same target), else 2-reflow
-    training.num_steps = 20_0010
-    training.batch_size = 2
-    training.gradient_accumulation_steps = 8
+    training.randz0 = 'fix' # NOTE : random noise for same target if 'random' ; else 'fix'
+    training.num_steps = 220000
+    training.batch_size = 3
+    training.gradient_accumulation_steps = 1
     training.mixed_precision='no'
     # # ! debug only
     # training.log_freq = 9
@@ -42,9 +42,9 @@ def get_config():
     sampling.method = 'rectified_flow'
     sampling.init_type = 'gaussian'
     sampling.init_noise_scale = 1.0
-    sampling.randz0 = False
+    sampling.randz0 = 'fix'
     sampling.use_ode_sampler = 'euler'
-    sampling.sample_N = 20
+    sampling.sample_N = 100
 
     # reflow
     config.reflow = reflow = ml_collections.ConfigDict()
@@ -53,13 +53,14 @@ def get_config():
 
     # data
     data = config.data
-    data.root_dir = 'data/coco2014_reflow'
-    data.dl_workers = 1
+    data.train_root = 'data/coco2014_reflow/train5M'
+    data.eval_root = 'data/coco2014_reflow/val10k'
+    data.dl_workers = 4
     # data.centered = True
     
     optim=config.optim
     optim.use_8bit_adam = False
-    optim.lr_scheduler='constant_with_warmup'
+    optim.lr_scheduler='linear'
     
     # config.device=None
 

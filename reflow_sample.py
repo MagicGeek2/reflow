@@ -11,9 +11,11 @@ from copy import deepcopy
 
 from reflow.utils import get_sampling_fn, set_seed, decode_latents
 from reflow.sde_lib import RectifiedFlow
-from reflow.data.reflow_with_text import DataPairsWithText
-from reflow.data.utils import get_image_transforms
+from reflow.data.reflow_with_text import DataPairsWithText, get_reflow_dataset
+from reflow.data.utils import get_image_transforms, LMDB_ndarray
 from reflow.utils import create_models, cycle, to_device
+
+from reflow.configs.sample import get_config # no need to import, just for convenience
 
 
 def main(argv):
@@ -21,12 +23,12 @@ def main(argv):
     config, eval_folder = FLAGS.config, FLAGS.eval_folder
     eval_folder = Path(eval_folder)
 
+    logger.add(f'{eval_folder}/sample.log')
     logger.info(f'\n{config}')
 
     sample_dir = eval_folder/"samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    # noise to final sample trajectories
     other_dirs = ["traj", "noise", "latent"]
     for odir in other_dirs:
         (eval_folder/odir).mkdir(exist_ok=True)
@@ -41,25 +43,30 @@ def main(argv):
     text_encoder.to(config.device).eval()
     score_model.to(config.device).eval().requires_grad_(False)
 
-    eval_ds = DataPairsWithText(
-        data_root=config.data.root_dir,
-        phase=config.data.phase,
+    eval_ds = get_reflow_dataset(
+        data_root=config.data.eval_root,
         tokenizer=tokenizer,
-        image_transforms=get_image_transforms(train=False, ),
+        src_type='lmdb',
     )
     eval_dl = DataLoader(
         eval_ds,
         batch_size=config.sampling.batch_size,
         shuffle=False,
         num_workers=config.data.dl_workers,
-        # collate_fn=partial(collate_fn, tokenizer=tokenizer)
+        drop_last=True, 
     )
     eval_iter = cycle(eval_dl)
 
-    # TODO: load 有效的 ckpt
     ckpt_path = config.sampling.ckpt_path
-    logger.info(f'load ckpt from {ckpt_path}')
-    score_model.load_state_dict(torch.load(ckpt_path, map_location=score_model.device), strict=False)
+    if ckpt_path=='':
+        logger.info(f'no resumed ckpt')
+        if config.diffusers.load_score_model:
+            logger.info(f'use pretrained diffusers score model')
+        else:
+            logger.info(f'totally random score model')
+    else:
+        logger.info(f'load ckpt from {ckpt_path}')
+        score_model.load_state_dict(torch.load(ckpt_path, map_location=score_model.device), strict=False)
 
     sde = RectifiedFlow(
         init_type=config.sampling.init_type,
@@ -115,6 +122,7 @@ def main(argv):
 
             # decode and save sampling captions
             captions = tokenizer.batch_decode(batch['input_ids'])[:bs]
+            captions = [s[4:s.find("<pad>")-4] for s in captions]
             caption_file.write('\n'.join(captions)+'\n')
 
             # sample, decode and save samples
@@ -124,7 +132,7 @@ def main(argv):
             z1 = eval_step_fn_input.pop('z1')
             sample, *ret = sampling_fn(
                 score_model,
-                z = None if config.sampling.randz0 else z0,
+                z = None if config.sampling.randz0 == 'random' else z0,
                 condition = eval_step_fn_input,
                 return_traj = config.sampling.return_traj
             )
@@ -141,13 +149,11 @@ def main(argv):
                     traj_i = make_grid(traj_i, nrow=len(traj_i), padding=2)
                     save_image(traj_i, str(eval_folder / "traj" / f'traj_{i}.png'))
 
-
             sample_cnt += bs
             pbar.update(bs)
             if stop_sampling:
                 break
 
-            # TODO: get all sample trajectories ; merge with get sample part
 
     caption_file.close()
     pbar.close()

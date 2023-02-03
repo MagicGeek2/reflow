@@ -1,0 +1,16 @@
+# absl
+accelerate
+# bitsandbytes==0.36.0.post2
+# diffusers==0.12.1
+einops
+loguru
+lpips
+ml_collections
+numpy
+scipy
+# torch==1.12.1
+# torchvision==0.13.1
+tqdm
+transformers
+tensorboard
+sentencepiece
